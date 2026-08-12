@@ -1,196 +1,129 @@
-class ReporterTasks {
-  private interval = 1000;
-  private tm: TaskManager;
-  private tq: TaskQueue;
+const isStringNotempty = (str: unknown): str is string => {
+  return typeof str === "string" && str.trim() !== "";
+};
+const isNumber = (num: unknown): num is number => {
+  return typeof num === "number" && !isNaN(num);
+};
 
-  constructor(tm: TaskManager, tq: TaskQueue) {
-    this.tm = tm;
-    this.tq = tq;
-  }
-  /**
-   * interval ごとに、tasksの状況をコンソールに出力する
-   */
-  report() {
-    let m = 0;
-    const timer = setInterval(() => {
-      if (m === 0) {
-        console.log("================================");
-      }
-      console.log(`${m}秒目`);
-      console.log(this.tm.get());
-      m++;
-      if (this.tq.isFinish()) {
-        clearInterval(timer);
+const createInvalidJobResult = (
+  reason: string,
+  job: Job | null = null,
+): InvalidJobResult => {
+  return {
+    valid: false,
+    reason: reason,
+    job: job,
+  };
+};
 
-        console.log("実行完了");
-        console.log(this.tm.getResult());
-      }
-      console.log("================================");
-    }, this.interval);
+const validateJob = (rawTask: unknown): ValidationResult => {
+  // rawTaskのオブジェクト判定
+  if (typeof rawTask !== "object" || rawTask === null)
+    return createInvalidJobResult("object型で設定されていない");
+
+  if (!("id" in rawTask) || !isStringNotempty(rawTask.id))
+    return createInvalidJobResult("idが未設定");
+
+  const validJob: Job = {
+    id: rawTask.id,
+    name: "-",
+    delay: 1000,
+    expectations: "success",
+  };
+
+  if ("name" in rawTask) {
+    if (isStringNotempty(rawTask.name)) {
+      validJob.name = rawTask.name;
+    } else {
+      return createInvalidJobResult("nameの型が異なる", validJob);
+    }
   }
-}
-class TaskQueue {
+
+  if ("expectations" in rawTask) {
+    const expectations = rawTask.expectations;
+    if (typeof expectations !== "string")
+      return createInvalidJobResult("expectationsの型が違う", validJob);
+    if (expectations !== "success" && expectations !== "failed")
+      return createInvalidJobResult(
+        "expectationsに success・failed 以外の値が設定されている",
+        validJob,
+      );
+    validJob.expectations = expectations;
+  }
+
+  if ("processing_time" in rawTask) {
+    if (!isNumber(rawTask.processing_time))
+      return createInvalidJobResult("processing_timeの型が違う", validJob);
+    let processingTime = rawTask.processing_time;
+    if (processingTime < 0)
+      return createInvalidJobResult("processing_timeが0未満", validJob);
+    processingTime = Math.ceil(processingTime);
+    const PROCESS_TIME_THRESHOLD = 10;
+    if (processingTime > PROCESS_TIME_THRESHOLD) {
+      validJob.delay = PROCESS_TIME_THRESHOLD * 1000;
+      validJob.expectations = "failed";
+      return {
+        valid: true,
+        job: validJob,
+        reason: "閾値超過",
+      };
+    } else {
+      validJob.delay = processingTime * 1000;
+    }
+  }
+
+  return {
+    valid: true,
+    job: validJob,
+  };
+};
+
+class JobQueue {
   private queue: (() => Promise<void>)[] = [];
+  private jobRecords: JobRecord[] = [];
+  private registeredIds: Set<string> = new Set();
   private acceptingJobs = true; // 登録中か？
-  private activeCount: number = 0; // 同時実行数
+  private activeJobCount: number = 0; // 同時実行数
   private maxConcurrency: number = 3; // 同時実行可能数
-  private PROCESSTIME_THRESHOLD: number = 10;
-  private tm: TaskManager;
-
-  constructor(tm: TaskManager) {
-    this.tm = tm;
-  }
+  private interval = 1000;
 
   finishAdding() {
     this.acceptingJobs = false;
   }
 
-  isFinish() {
+  isFinished() {
     return (
       this.acceptingJobs === false &&
       this.queue.length === 0 &&
-      this.activeCount === 0
+      this.activeJobCount === 0
     );
   }
 
-  private invalidResult = (
-    reason: string,
-    job?: validJobType,
-  ): ValidationResult => {
-    return {
-      valid: false,
-      reason: reason,
-      job: job ? job : null,
-    };
-  };
-
-  private duplicateId(id: string) {
-    const tmTask = this.tm.getById(id);
-    console.log(tmTask);
-    if (typeof tmTask === "object") {
-      return this.invalidResult("重複ID");
-    }
-  }
-
-  validate(job: unknown): ValidationResult {
-    let jobId = "-";
-    if (typeof job !== "object" || job === null) {
-      return (
-        this.duplicateId(jobId) || this.invalidResult("jobがobject型ではない")
-      );
-    }
-
-    // id が jobに存在するか？
-    if (!("id" in job) || typeof job.id !== "string" || job.id.trim() === "") {
-      //同一IDがすでにある
-      const tmTask = this.tm.getById(jobId);
-      console.log(tmTask);
-      if (tmTask === undefined) {
-        return this.invalidResult("idが設定されていない");
-      } else {
-        console.log("重複ID");
-        return this.invalidResult("重複ID");
-      }
-    }
-
-    jobId = job.id;
-    const validJob: validJobType = {
-      id: jobId,
-      name: "-",
-      processing_time: 1,
-      expectations: "success",
-    };
-
-    if ("name" in job) {
-      if (typeof job.name === "string" && job.name.trim() !== "") {
-        validJob.name = job.name;
-      }
-    }
-
-    if ("expectations" in job) {
-      const expectations = job.expectations;
-      if (typeof expectations !== "string")
-        return this.invalidResult("expectationsの型が違う", validJob);
-      if (expectations !== "success" && expectations !== "failed")
-        return this.invalidResult(
-          "expectationsに success・failed 以外の値が設定されている",
-          validJob,
-        );
-      validJob.expectations = expectations;
-    }
-
-    if ("processing_time" in job) {
-      if (typeof job.processing_time !== "number" || isNaN(job.processing_time))
-        return this.invalidResult("processing_timeの型が違う", validJob);
-
-      let processingTime = job.processing_time;
-      if (processingTime < 0)
-        return this.invalidResult("processing_timeが0未満", validJob);
-
-      processingTime = Math.ceil(processingTime);
-      if (processingTime > this.PROCESSTIME_THRESHOLD) {
-        validJob.processing_time = this.PROCESSTIME_THRESHOLD;
-        validJob.expectations = "failed";
-        return {
-          valid: true,
-          job: validJob,
-          reason: "閾値超過",
-        };
-      } else {
-        validJob.processing_time = processingTime;
-      }
-    }
-
-    return {
-      valid: true,
-      job: validJob,
-    };
-  }
   // que への追加
-  add(job: unknown, index: number) {
-    const validationResult: ValidationResult = this.validate(job);
-    if (validationResult.valid === true) {
-      const validTask = validationResult.job;
-      this.tm.update("pending", index, validTask, validationResult?.reason);
-      const delay: number = validTask.processing_time * 1000;
-      if (validTask.expectations === "success") {
-        this.enqueueSuccessfulJob(delay, validTask, index);
-      } else {
-        this.enqueueFailedJob(delay, validTask, index);
-      }
-      this.run();
-    } else if (validationResult.valid === false) {
-      this.tm.update(
-        "failed",
-        index,
-        validationResult.job,
-        validationResult.reason,
-      );
+  add(validJobRecord: Job, index: number) {
+    if (validJobRecord.expectations === "success") {
+      this.enqueueSuccessfulJob(validJobRecord, index);
+    } else {
+      this.enqueueFailedJob(validJobRecord, index);
     }
+    this.registerId(validJobRecord.id);
+    this.run();
   }
 
   // success時の処理
-  private enqueueSuccessfulJob = (
-    delay: number,
-    job: validJobType,
-    index: number,
-  ): void => {
+  private enqueueSuccessfulJob = (job: Job, index: number): void => {
     this.queue.push(async () => {
-      this.tm.update("running", index, job);
-      await this.delayResolve(delay);
-      this.tm.update("success", index, job);
+      this.updateStatus("running", index);
+      await this.delayResolve(job.delay);
+      this.updateStatus("success", index);
     });
   };
 
-  private enqueueFailedJob = (
-    delay: number,
-    job: validJobType,
-    index: number,
-  ): void => {
+  private enqueueFailedJob = (job: Job, index: number): void => {
     this.queue.push(async () => {
-      this.tm.update("running", index, job);
-      await this.delayReject(delay).catch(() => {});
-      this.tm.update("failed", index, job);
+      this.updateStatus("running", index);
+      await this.delayReject(job.delay).catch(() => {});
+      this.updateStatus("failed", index);
     });
   };
 
@@ -211,73 +144,68 @@ class TaskQueue {
   };
 
   private run() {
-    // 同時実行数が上限あるいは、実行対象タスクがない
-    if (this.activeCount === this.maxConcurrency || this.queue.length === 0) {
+    // 同時実r行数が上限あるいは、実行対象タスクがない
+    if (
+      this.activeJobCount === this.maxConcurrency ||
+      this.queue.length === 0
+    ) {
       return;
     }
     // 繰り上げ
-    const task = this.queue.shift();
-    if (!task) return;
-    this.activeCount++;
-    task().finally(() => {
-      this.activeCount--;
+    const job = this.queue.shift();
+    if (!job) return;
+    this.activeJobCount++;
+    job().finally(() => {
+      this.activeJobCount--;
       this.run();
     });
   }
-}
-
-class TaskManager {
-  private tasks: tasksType = {};
-  private results: result[] = [];
-  constructor() {}
-
-  get() {
-    return this.tasks;
-  }
-  getById(id: string) {
-    return this.tasks[id];
-  }
-
-  // タスクステータスの変更
-  update(
-    status: status,
-    index: number,
-    job?: validJobType | null,
-    reason?: string,
-  ) {
-    const jobId = job?.id || "-";
-    const currentTask = this.tasks[jobId];
-    const validName = job?.name || currentTask?.name || "-";
-    let validReason = reason || currentTask?.reason || null;
-    this.tasks[jobId] = {
-      name: validName,
+  // ================= ステータス ==============================
+  taskInit(validateResult: ValidationResult, index: number, status: JobStatus) {
+    this.jobRecords[index] = {
+      ...validateResult,
       status: status,
-      reason: currentTask?.reason || reason || null,
     };
+  }
 
-    if (status === "success" || status === "failed") {
-      this.results[index] = {
-        id: jobId,
-        name: validName,
-        status: status,
-        reason: validReason,
-      };
+  private registerId = (id: string): void => {
+    this.registeredIds.add(id);
+  };
+
+  // すでに登録済みか？
+  isRegisteredId = (id: string): boolean => {
+    return this.registeredIds.has(id);
+  };
+
+  // ステータスのアップデート
+  private updateStatus(status: JobStatus, index: number): void {
+    if (this.jobRecords[index]) {
+      this.jobRecords[index].status = status;
     }
   }
 
-  getResult() {
-    return this.results;
+  showStatus() {
+    let elapsedSeconds = 0;
+    const timer = setInterval(() => {
+      if (elapsedSeconds === 0) {
+        console.log("================================");
+      }
+      console.log(`${elapsedSeconds}秒目`);
+      console.log(this.jobRecords);
+      elapsedSeconds++;
+      if (this.isFinished()) {
+        clearInterval(timer);
+        console.log("実行完了");
+        console.log("================================");
+      }
+    }, this.interval);
   }
 }
 
-// jobsの情報
-
 const main = () => {
-  const tm: TaskManager = new TaskManager();
-  const taskques = new TaskQueue(tm);
-  const reporterTasks = new ReporterTasks(tm, taskques);
-  reporterTasks.report();
+  const jobQueue = new JobQueue();
 
+  jobQueue.showStatus();
   // ジョブの取得
   const rawTasks: unknown = [
     "テスト",
@@ -295,16 +223,16 @@ const main = () => {
       expectations: "failed",
     },
     {
-      id: "003",
+      id: "001",
       name: "JOB2",
       processing_time: 15,
       expectations: "success",
     },
     {
-      id: "004",
+      id: "001",
       name: "JOB2",
       processing_time: 1,
-      expectations: "failed",
+      expectations: "success",
     },
     {
       id: "005",
@@ -320,52 +248,52 @@ const main = () => {
   }
 
   let index = 0;
-  for (let rowTask of rawTasks) {
-    // job がオブジェクトか？
-    taskques.add(rowTask, index);
+  for (let rawTask of rawTasks) {
+    let validateResult: ValidationResult = validateJob(rawTask);
+    const jobId = validateResult?.job?.id;
+    if (jobId && jobQueue.isRegisteredId(jobId)) {
+      validateResult = createInvalidJobResult("id重複", validateResult.job);
+    }
+
+    if (validateResult.valid === true) {
+      const job: Job = validateResult.job;
+      jobQueue.taskInit(validateResult, index, "pending");
+      jobQueue.add(job, index);
+    } else if (validateResult.valid === false) {
+      jobQueue.taskInit(validateResult, index, "failed");
+    }
     index++;
   }
-  taskques.finishAdding();
+  jobQueue.finishAdding();
 };
 
 // => "running"
 
 main();
 
-type ValidationResult =
-  | {
-      valid: true;
-      job: validJobType;
-      reason?: string;
-    }
-  | {
-      valid: false;
-      job?: validJobType | null;
-      reason: string;
-    };
+type ValidationResult = ValidJobResult | InvalidJobResult;
 
-type validJobType = {
+type ValidJobResult = {
+  valid: true;
+  job: Job;
+  reason?: string;
+};
+
+type InvalidJobResult = {
+  valid: false;
+  job?: Job | null;
+  reason: string;
+};
+
+type Job = {
   id: string;
   name: string;
-  processing_time: number;
+  delay: number;
   expectations: "success" | "failed";
 };
 
-type taskType = {
-  name: string;
-  status: status; // 状態
-  reason: string | null;
+type JobRecord = ValidationResult & {
+  status: JobStatus;
 };
 
-type tasksType = {
-  [id: string]: taskType;
-};
-
-type status = "pending" | "running" | "success" | "failed";
-
-type result = {
-  id: string;
-  name: string;
-  status: "success" | "failed";
-  reason: string | null;
-};
+type JobStatus = "pending" | "running" | "success" | "failed";
